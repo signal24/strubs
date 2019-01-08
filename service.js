@@ -9,4 +9,10 @@ process.on('uncaughtException', err => {
     process.exit(-2);
 });
 
+process.on('unhandledRejection', err => {
+    log.error('!! an uncaught promise rejection has occurred', err);
+    log.error('terminating');
+    process.exit(-2);
+});
+
 new Core();

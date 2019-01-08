@@ -13,6 +13,7 @@
     "@ronomon/reed-solomon": "^5.0.3",
     "colors": "^1.3.2",
     "diskusage": "^0.2.6",
+    "fuse-bindings": "^2.11.2",
     "lodash": "^4.17.11",
     "mongodb": "^3.1.10",
     "udev": "git+https://github.com/cheery/node-udev.git#9d3312c9f774686f115e2b3623ccccd45e6eb82a",
