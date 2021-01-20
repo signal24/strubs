@@ -1,13 +1,13 @@
 {
   "name": "strubs",
-  "version": "1.0.0",
-  "description": "",
+  "version": "0.1.0",
+  "description": "STRUBS (Striping & Redundancy using Basic Disks): A single-host fault-tolerant mass-storage service for providing a scalable storage system for small scale operations.",
   "main": "service.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "author": "",
-  "license": "ISC",
+  "author": "Signal24 <hello@sgnl24.com>",
+  "license": "AGPL-3.0-only",
   "dependencies": {
     "@ronomon/crypto-async": "^3.0.1",
     "@ronomon/reed-solomon": "^5.0.3",
