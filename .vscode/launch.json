@@ -18,9 +18,7 @@
             "request": "attach",
             "name": "Attach to remote",
             "address": "127.0.0.1",
-            "port": 9229,
-            "localRoot": "${workspaceFolder}",
-            "remoteRoot": "/opt/strubs"
+            "port": 9229
         }
     ]
 }
