@@ -1,0 +1,15 @@
+{
+    "extends": "@tsconfig/node24/tsconfig.json",
+    "compilerOptions": {
+        "rootDir": ".",
+        "outDir": "dist",
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "skipLibCheck": true
+    },
+    "include": [
+        "service.ts",
+        "lib/**/*.ts",
+        "lib/**/*.d.ts"
+    ]
+}

@@ -1,0 +1,360 @@
+import { HttpHelpers } from './helpers';
+import { HttpBadRequestError, HttpNotFoundError } from './errors';
+import { ioManager } from '../../io/manager';
+import { deviceProvisioner } from '../../io/device-provisioner';
+import { listRawBlockDevices, type RawBlockDevice } from '../../io/device-discovery';
+import { verifyJob } from '../../jobs/verify-job';
+import { database } from '../../database';
+import type { HttpRequest, HttpResponse } from './server';
+import type { Volume } from '../../io/volume';
+
+type VolumeStatus = {
+    id: number;
+    uuid: string;
+    blockPath: string | null;
+    mountPoint: string | null;
+    isMounted: boolean;
+    isVerified: boolean;
+    isStarted: boolean;
+    isEnabled: boolean;
+    isHealthy: boolean;
+    isReadOnly: boolean;
+    deviceSerial: string | null;
+    partitionUuid: string | null;
+    bytesTotal: number;
+    bytesFree: number | null;
+    verifyErrors: Volume['verifyErrors'];
+    isDeleted: boolean;
+};
+
+type RouteParams = Record<string, unknown>;
+type FileInfoRouteParams = RouteParams & { normalizedPath: string };
+type RouteHandler = (req: HttpRequest, params: RouteParams) => Promise<unknown>;
+type RouteDefinition = {
+    method: string;
+    match: (url: string) => RouteParams | null;
+    handler: RouteHandler;
+};
+type RouteMatch = { handler: RouteHandler; params: RouteParams };
+
+export class HttpMgmt {
+    private static readonly routes: RouteDefinition[] = HttpMgmt.createRoutes();
+
+    static async handle(_requestId: number, req: HttpRequest, _res: HttpResponse): Promise<unknown> {
+        const method = req.method?.toUpperCase();
+        const url = req.url;
+        if (!method || !url)
+            throw new HttpNotFoundError();
+
+        const route = this.findRoute(method, url);
+        if (!route)
+            throw new HttpNotFoundError();
+
+        return route.handler.call(this, req, route.params);
+    }
+
+    private static async handleVolumesRequest(req: HttpRequest): Promise<VolumeStatus[]> {
+        const includeDeleted = this.shouldIncludeDeleted(req.params);
+        return this.getVolumeStatus(includeDeleted);
+    }
+
+    private static async handleBlockDevicesRequest(): Promise<RawBlockDevice[]> {
+        return listRawBlockDevices();
+    }
+
+    private static async handleVerifyJobStartRequest(): Promise<{ startedAt: string }> {
+        return verifyJob.start();
+    }
+
+    private static async handleVerifyJobStopRequest(): Promise<{ stopped: boolean }> {
+        await verifyJob.stop();
+        return { stopped: true };
+    }
+
+    private static async handleVerifyJobStatusRequest(): Promise<{ running: boolean; startedAt: string | null; objectsVerified: number; errors: { total: number; volumes: Record<string, number> } }> {
+        return verifyJob.getStatus();
+    }
+
+    private static async handleVolumeCreationRequest(req: HttpRequest): Promise<VolumeStatus> {
+        const payload = await this.parseJsonBody<{ blockPath?: string; wipe?: unknown; replace?: unknown }>(req);
+        const blockPath = payload.blockPath;
+        const wipe = payload.wipe;
+        const replace = payload.replace;
+        if (!blockPath || typeof blockPath !== 'string')
+            throw new HttpBadRequestError('blockPath must be provided');
+        let wipeFlag: boolean | undefined;
+        if (wipe !== undefined) {
+            if (typeof wipe !== 'number' || Number.isNaN(wipe))
+                throw new HttpBadRequestError('wipe must be provided as a timestamp');
+            const now = Date.now();
+            if (Math.abs(now - wipe) > 10_000)
+                throw new HttpBadRequestError('wipe timestamp must be within 10 seconds of current time');
+            wipeFlag = true;
+        }
+        if (replace !== undefined && typeof replace !== 'boolean')
+            throw new HttpBadRequestError('replace must be a boolean');
+
+        const volumeConfig = await deviceProvisioner.provision({
+            blockPath,
+            wipe: wipeFlag,
+            replace: replace as boolean | undefined
+        });
+
+        const volume = ioManager.getVolume(volumeConfig.id);
+        if (!volume)
+            throw new Error('failed to register volume');
+
+        return this._serializeVolume(volumeConfig.id, volume);
+    }
+
+    private static async handleVolumeDeleteRequest(params: RouteParams): Promise<{ deleted: boolean }> {
+        const idRaw = (params.id ?? '') as string;
+        const id = Number.parseInt(idRaw, 10);
+        if (!Number.isFinite(id))
+            throw new HttpBadRequestError('invalid volume id');
+        await database.softDeleteVolume(id);
+        await ioManager.softDeleteVolume(id).catch(() => undefined);
+        return { deleted: true };
+    }
+
+    private static async handleVolumeUpdateRequest(req: HttpRequest, params: RouteParams): Promise<{ updated: boolean }> {
+        const payload = await this.parseJsonBody<{ isEnabled?: unknown; isReadOnly?: unknown; isDeleted?: unknown }>(req);
+        const idRaw = (params.id ?? '') as string;
+        const id = Number.parseInt(idRaw, 10);
+        if (!Number.isFinite(id))
+            throw new HttpBadRequestError('invalid volume id');
+
+        const updates: { isEnabled?: boolean; isReadOnly?: boolean; isDeleted?: boolean } = {};
+        let shouldSoftDelete = false;
+
+        if (payload.isEnabled !== undefined) {
+            if (typeof payload.isEnabled !== 'boolean')
+                throw new HttpBadRequestError('isEnabled must be a boolean');
+            updates.isEnabled = payload.isEnabled;
+        }
+
+        if (payload.isReadOnly !== undefined) {
+            if (typeof payload.isReadOnly !== 'boolean')
+                throw new HttpBadRequestError('isReadOnly must be a boolean');
+            updates.isReadOnly = payload.isReadOnly;
+        }
+
+        if (payload.isDeleted !== undefined) {
+            if (typeof payload.isDeleted !== 'boolean')
+                throw new HttpBadRequestError('isDeleted must be a boolean');
+            if (payload.isDeleted)
+                shouldSoftDelete = true;
+            else
+                updates.isDeleted = false;
+        }
+
+        if (!shouldSoftDelete && !Object.keys(updates).length)
+            throw new HttpBadRequestError('no valid fields to update');
+
+        if (shouldSoftDelete) {
+            await database.softDeleteVolume(id);
+            await ioManager.softDeleteVolume(id).catch(() => undefined);
+        }
+
+        if (Object.keys(updates).length) {
+            await database.updateVolumeFlags(id, updates);
+            await ioManager.updateVolumeFlags(id, updates);
+        }
+
+        return { updated: true };
+    }
+
+    private static async getVolumeStatus(includeDeleted: boolean): Promise<VolumeStatus[]> {
+        const entries = ioManager.getVolumeEntries();
+        return entries
+            .filter(([, volume]) => includeDeleted || !volume.isDeleted)
+            .map(([id, volume]) => this._serializeVolume(id, volume));
+    }
+
+    private static _serializeVolume(id: number, volume: Volume): VolumeStatus {
+        return {
+            id,
+            uuid: volume.uuid,
+            blockPath: volume.blockPath,
+            mountPoint: volume.mountPoint,
+            isMounted: volume.isMounted,
+            isVerified: volume.isVerified,
+            isStarted: volume.isStarted,
+            isEnabled: volume.isEnabled,
+            isHealthy: volume.isHealthy,
+            isReadOnly: volume.isReadOnly,
+            deviceSerial: volume.deviceSerial,
+            partitionUuid: volume.partitionUuid,
+            bytesTotal: volume.bytesTotal,
+            bytesFree: volume.bytesFree,
+            verifyErrors: volume.verifyErrors,
+            isDeleted: volume.isDeleted
+        };
+    }
+
+    private static async handleFileInfoRequest(params: FileInfoRouteParams): Promise<Record<string, unknown>> {
+        const objectMeta = await HttpHelpers.getObjectMeta(params.normalizedPath);
+        if (!objectMeta || !objectMeta.dataVolumes || !objectMeta.parityVolumes)
+            throw new HttpNotFoundError();
+        const { dataVolumes, parityVolumes } = objectMeta as typeof objectMeta & {
+            dataVolumes: number[];
+            parityVolumes: number[];
+        };
+
+        const slicePaths = await this._mapAsync(dataVolumes, async (volumeId, idx) => {
+            const volume = ioManager.getVolume(volumeId);
+            if (!volume)
+                return `Error: volume ${volumeId} not found`;
+            try {
+                return await volume.getCommitedPath(`${objectMeta.id}.${idx}`);
+            }
+            catch (err) {
+                return `Error: ${err}`;
+            }
+        });
+        const parityPaths = await this._mapAsync(parityVolumes, async (volumeId, idx) => {
+            const volume = ioManager.getVolume(volumeId);
+            if (!volume)
+                return `Error: volume ${volumeId} not found`;
+            try {
+                return await volume.getCommitedPath(`${objectMeta.id}.${idx + dataVolumes.length}`);
+            }
+            catch (err) {
+                return `Error: ${err}`;
+            }
+        });
+
+        return {
+            'X-Object-Id': objectMeta.id,
+            'X-Container-Id': objectMeta.containerId,
+            'Content-MD5': objectMeta.md5?.toString('hex'),
+            'Content-Type': objectMeta.mime,
+            'X-Data-Slice-Count': dataVolumes.length,
+            'X-Data-Slice-Volumes': dataVolumes,
+            'X-Parity-Slice-Count': parityVolumes.length,
+            'X-Parity-Slice-Volumes': parityVolumes,
+            'X-Chunk-Size': objectMeta.chunkSize,
+            slicePaths,
+            parityPaths
+        };
+    }
+
+    private static async _mapAsync<T, U>(items: T[], callback: (item: T, index: number) => Promise<U>): Promise<U[]> {
+        const result: U[] = [];
+        for (let i = 0; i < items.length; i++) {
+            result.push(await callback(items[i], i));
+        }
+        return result;
+    }
+
+    private static findRoute(method: string, url: string): RouteMatch | null {
+        for (const route of this.routes) {
+            if (route.method !== method)
+                continue;
+            const params = route.match(url);
+            if (params)
+                return { handler: route.handler, params };
+        }
+        return null;
+    }
+
+    private static createRoutes(): RouteDefinition[] {
+        return [
+            {
+                method: 'GET',
+                match: url => url === '/$/volumes' ? {} : null,
+                handler: async req => this.handleVolumesRequest(req)
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/blockDevices' ? {} : null,
+                handler: async () => this.handleBlockDevicesRequest()
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/volumes' ? {} : null,
+                handler: async req => this.handleVolumeCreationRequest(req)
+            },
+            {
+                method: 'PUT',
+                match: url => this.matchVolumeDeleteRoute(url),
+                handler: async (req, params) => this.handleVolumeUpdateRequest(req, params)
+            },
+            {
+                method: 'DELETE',
+                match: url => this.matchVolumeDeleteRoute(url),
+                handler: async (_req, params) => this.handleVolumeDeleteRequest(params)
+            },
+            {
+                method: 'POST',
+                match: url => url === '/$/jobs/verify' ? {} : null,
+                handler: async () => this.handleVerifyJobStartRequest()
+            },
+            {
+                method: 'GET',
+                match: url => url === '/$/jobs/verify' ? {} : null,
+                handler: async () => this.handleVerifyJobStatusRequest()
+            },
+            {
+                method: 'DELETE',
+                match: url => url === '/$/jobs/verify' ? {} : null,
+                handler: async () => this.handleVerifyJobStopRequest()
+            },
+            {
+                method: 'GET',
+                match: url => this.matchFileInfoRoute(url),
+                handler: async (_req, params) => this.handleFileInfoRequest(params as FileInfoRouteParams)
+            }
+        ];
+    }
+
+    private static shouldIncludeDeleted(params: RouteParams): boolean {
+        const value = params.includeDeleted;
+        if (typeof value === 'string')
+            return value.toLowerCase() === 'true';
+        if (Array.isArray(value))
+            return value.some(item => typeof item === 'string' && item.toLowerCase() === 'true');
+        return false;
+    }
+
+    private static matchFileInfoRoute(url: string): FileInfoRouteParams | null {
+        const prefix = '/$/fileinfo/';
+        if (!url.toLowerCase().startsWith(prefix))
+            return null;
+        const requestedPath = url.slice(prefix.length);
+        const normalizedPath = requestedPath.startsWith('/') ? requestedPath : '/' + requestedPath;
+        return { normalizedPath };
+    }
+
+    private static matchVolumeDeleteRoute(url: string): RouteParams | null {
+        const match = /^\/\$\/volumes\/(\d+)$/.exec(url);
+        if (!match)
+            return null;
+        return { id: match[1] };
+    }
+
+    private static async parseJsonBody<T>(req: HttpRequest): Promise<T> {
+        const body = await this.readRequestBody(req);
+        if (!body.length)
+            return {} as T;
+        try {
+            return JSON.parse(body.toString('utf-8')) as T;
+        }
+        catch (err) {
+            throw new HttpBadRequestError('invalid JSON body');
+        }
+    }
+
+    private static readRequestBody(req: HttpRequest): Promise<Buffer> {
+        return new Promise((resolve, reject) => {
+            const chunks: Buffer[] = [];
+            req.on('data', chunk => {
+                chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+            });
+            req.on('end', () => resolve(Buffer.concat(chunks)));
+            req.on('error', reject);
+            req.on('aborted', () => reject(new HttpBadRequestError('request aborted')));
+        });
+    }
+
+}
