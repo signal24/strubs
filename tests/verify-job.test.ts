@@ -11,6 +11,7 @@ class FileObjectStub extends EventEmitter {
     size = 1;
     private readonly error?: Error;
     private requestId: string | number | null = null;
+    private priority: 'normal' | 'low' = 'normal';
 
     constructor(error?: Error) {
         super();
@@ -43,6 +44,14 @@ class FileObjectStub extends EventEmitter {
 
     getRequestId(): string | null {
         return this.requestId;
+    }
+
+    setPriority(priority: 'normal' | 'low'): void {
+        this.priority = priority;
+    }
+
+    getPriority(): 'normal' | 'low' {
+        return this.priority;
     }
 
     getLoggerPrefix(): string {

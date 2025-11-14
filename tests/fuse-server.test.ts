@@ -80,6 +80,7 @@ class FileObjectStub extends EventEmitter {
     prepareForRead = vi.fn().mockResolvedValue(undefined);
     close = vi.fn().mockResolvedValue(undefined);
     requestId: string | null = null;
+    priority: 'normal' | 'low' = 'normal';
 
     setRequestId(requestId: string | null): void {
         this.requestId = requestId ?? null;
@@ -87,6 +88,14 @@ class FileObjectStub extends EventEmitter {
 
     getRequestId(): string | null {
         return this.requestId;
+    }
+
+    setPriority(priority: 'normal' | 'low'): void {
+        this.priority = priority;
+    }
+
+    getPriority(): 'normal' | 'low' {
+        return this.priority;
     }
 
     getLoggerPrefix(): string {

@@ -195,7 +195,7 @@ export class VerifyJob {
     private async verifyObject(record: StoredObjectRecord, startedAtMs: number): Promise<VerifyObjectResult | null> {
         let object: FileObject | null = null;
         try {
-            object = await this.deps.fileObjectService.openForRead(record, { requestId: `verify` });
+            object = await this.deps.fileObjectService.openForRead(record, { requestId: `verify`, priority: 'low' });
             if (this.cancelRequested)
                 return null;
             await this.consumeObject(object);

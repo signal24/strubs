@@ -11,6 +11,7 @@ import { Plan } from './plan';
 import { FileObjectWriter } from './file-object/writer';
 import { FileObjectReader } from './file-object/reader';
 import { FileObjectDestroyer } from './file-object/destroyer';
+import type { VolumePriority } from './volume-priority-manager';
 
 type FileObjectMode = 'write' | 'read' | null;
 
@@ -82,6 +83,7 @@ export class FileObject extends Duplex {
     plan: Plan | null = null;
     private _requestId: string | null = null;
     private _loggerPrefix = 'file:uninitialized';
+    private _priority: VolumePriority = 'normal';
 
     constructor(deps?: Partial<FileObjectDependencies>) {
         super();
@@ -213,6 +215,14 @@ export class FileObject extends Duplex {
 
     getRequestId(): string | null {
         return this._requestId;
+    }
+
+    setPriority(priority: VolumePriority): void {
+        this._priority = priority;
+    }
+
+    getPriority(): VolumePriority {
+        return this._priority;
     }
 
     getLoggerPrefix(): string {

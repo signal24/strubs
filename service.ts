@@ -1,5 +1,6 @@
 import { Core } from './lib/core';
 import { createLogger } from './lib/log';
+import { ioShutdown } from './lib/io/io-shutdown';
 
 const log = createLogger('bootstrap');
 
@@ -38,5 +39,12 @@ const handleShutdown = async (signal: NodeJS.Signals): Promise<void> => {
     }
 };
 
-process.on('SIGINT', () => void handleShutdown('SIGINT'));
-process.on('SIGTERM', () => void handleShutdown('SIGTERM'));
+const registerSignalHandler = (signal: NodeJS.Signals): void => {
+    process.on(signal, () => {
+        ioShutdown.abort(signal);
+        void handleShutdown(signal);
+    });
+};
+
+registerSignalHandler('SIGINT');
+registerSignalHandler('SIGTERM');
