@@ -31,7 +31,7 @@ export interface StoredObjectRecord extends ContentDocument {
     unavailableSlices?: number[];
     damagedSlices?: number[];
     sliceErrors?: Record<string, SliceErrorInfo>;
-    lastVerifiedAt?: number | null;
+    lastVerifiedAt?: Date | null;
 }
 
 // TODO: make sure data is actually flushed to disk on _finish

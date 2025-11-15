@@ -219,7 +219,7 @@ export class VolumeFleet {
         if (!config)
             throw new Error('volume configuration not found');
 
-        let volume = this._volumes[id];
+        let volume: Volume | undefined = this._volumes[id];
 
         if (changes.isDeleted !== undefined) {
             if (changes.isDeleted) {

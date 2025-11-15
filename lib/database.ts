@@ -127,13 +127,13 @@ export class Database {
         return this.contentRepository.getObjectByPath(path);
     }
 
-    async findObjectsNeedingVerification(startedAt: number, limit: number): Promise<ContentDocument[]> {
+    async findObjectsNeedingVerification(startedAt: Date, limit: number): Promise<ContentDocument[]> {
         return this.contentRepository.findObjectsNeedingVerification(startedAt, limit);
     }
 
     async updateObjectVerificationState(
         id: ObjectIdentifier,
-        updates: { lastVerifiedAt?: number; sliceErrors?: Record<string, SliceErrorInfo> | null }
+        updates: { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null }
     ): Promise<void> {
         await this.contentRepository.updateObjectVerificationState(id, updates);
     }

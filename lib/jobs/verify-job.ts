@@ -5,6 +5,7 @@ import type { StoredObjectRecord, FileObject } from '../io/file-object';
 import { ioManager } from '../io/manager';
 import { createLogger } from '../log';
 import type { Volume } from '../io/volume';
+import { FileObjectSliceVerifier } from '../io/file-object/slice-verifier';
 
 type VolumeErrorCounters = {
     checksum: number;
@@ -17,6 +18,7 @@ type VerifyJobDeps = {
     fileObjectService: FileObjectService;
     ioManager: typeof ioManager;
     createLogger: typeof createLogger;
+    createSliceVerifier: (object: FileObject) => { verifySlice: (sliceIndex: number) => Promise<void> };
 };
 
 type VerifyErrorSnapshot = {
@@ -35,7 +37,8 @@ const defaultDeps: VerifyJobDeps = {
     runtimeConfig,
     fileObjectService,
     ioManager,
-    createLogger
+    createLogger,
+    createSliceVerifier: (object: FileObject) => new FileObjectSliceVerifier(object)
 };
 
 const VERIFY_BATCH_SIZE = 25;
@@ -88,10 +91,8 @@ export class VerifyJob {
 
     async stop(): Promise<void> {
         const running = this.running;
-        if (!running) {
-            await this.deps.runtimeConfig.delete('verifyStartedAt');
+        if (!running)
             return;
-        }
         this.log('stop requested');
         this.cancelRequested = true;
         await running;
@@ -115,6 +116,10 @@ export class VerifyJob {
             return;
 
         this.startedAt = startedAt;
+        if (isResume)
+            this.log('starting verification (resume) at %s', startedAt);
+        else
+            this.log('starting verification at %s', startedAt);
         this.cancelRequested = false;
         this.progress.objectsVerified = 0;
         this.progress.errors = { total: 0, volumes: {} };
@@ -132,8 +137,8 @@ export class VerifyJob {
     }
 
     private async execute(startedAt: string, isResume: boolean): Promise<void> {
-        const startedAtMs = Date.parse(startedAt);
-        if (!Number.isFinite(startedAtMs))
+        const startedAtDate = new Date(startedAt);
+        if (!Number.isFinite(startedAtDate.getTime()))
             throw new Error('invalid verify start time');
 
         const volumeCounts = this.initializeVolumeCounters();
@@ -144,14 +149,14 @@ export class VerifyJob {
 
         try {
             while (!this.cancelRequested) {
-                const batch = await this.fetchBatch(startedAtMs);
+                const batch = await this.fetchBatch(startedAtDate);
                 if (!batch.length)
                     break;
 
                 for (const record of batch) {
                     if (this.cancelRequested)
                         break;
-                    const result = await this.verifyObject(record, startedAtMs);
+                    const result = await this.verifyObject(record, startedAtDate);
                     if (!result)
                         break;
                     this.progress.objectsVerified++;
@@ -166,14 +171,24 @@ export class VerifyJob {
             }
         }
         finally {
-            await this.deps.runtimeConfig.delete('verifyStartedAt');
+            if (!this.cancelRequested)
+                await this.deps.runtimeConfig.delete('verifyStartedAt');
             if (!this.cancelRequested) {
+                const finishedAt = new Date().toISOString();
                 await this.deps.runtimeConfig.set('lastVerify', {
                     startedAt,
-                    finishedAt: new Date().toISOString(),
+                    finishedAt,
                     checksumErrors,
                     totalErrors
                 });
+                this.log(
+                    'verification complete: startedAt=%s finishedAt=%s objects=%d checksumErrors=%d totalErrors=%d',
+                    startedAt,
+                    finishedAt,
+                    this.progress.objectsVerified,
+                    checksumErrors,
+                    totalErrors
+                );
             }
         }
     }
@@ -187,33 +202,91 @@ export class VerifyJob {
         return counts;
     }
 
-    private async fetchBatch(startedAt: number): Promise<StoredObjectRecord[]> {
+    private async fetchBatch(startedAt: Date): Promise<StoredObjectRecord[]> {
         const objects = await this.deps.database.findObjectsNeedingVerification(startedAt, VERIFY_BATCH_SIZE);
         return objects as StoredObjectRecord[];
     }
 
-    private async verifyObject(record: StoredObjectRecord, startedAtMs: number): Promise<VerifyObjectResult | null> {
-        let object: FileObject | null = null;
+    private async verifyObject(record: StoredObjectRecord, startedAt: Date): Promise<VerifyObjectResult | null> {
         try {
-            object = await this.deps.fileObjectService.openForRead(record, { requestId: `verify`, priority: 'low' });
             if (this.cancelRequested)
                 return null;
-            await this.consumeObject(object);
+
+            const object = await this.deps.fileObjectService.load(record, { requestId: 'verify', priority: 'low' });
+            const verifier = this.deps.createSliceVerifier(object);
+
+            const totalSlices = record.dataVolumes.length + record.parityVolumes.length;
+            const sliceErrors: Record<string, SliceErrorInfo> = {};
+            const volumeImpacts = new Map<number, VolumeErrorCounters>();
+            let checksumErrors = 0;
+            let totalErrors = 0;
+
+            for (let sliceIndex = 0; sliceIndex < totalSlices; sliceIndex++) {
+                if (this.cancelRequested)
+                    return null;
+                try {
+                    await verifier.verifySlice(sliceIndex);
+                }
+                catch (err) {
+                    if (this.isIOAbortError(err)) {
+                        this.cancelRequested = true;
+                        this.log('object %s verification aborted due to I/O shutdown', record.id);
+                        return null;
+                    }
+                    const normalized = this.normalizeSliceError(record, err);
+                    const message = err instanceof Error ? err.message : String(err);
+                    if (!normalized) {
+                        this.log.error('object %s slice %d verification failed: %s', record.id, sliceIndex, message);
+                        continue;
+                    }
+
+                    sliceErrors[normalized.sliceKey] = normalized.info;
+                    totalErrors++;
+                    if (normalized.isChecksum)
+                        checksumErrors++;
+
+                    if (normalized.volumeId !== null && normalized.volumeId !== undefined) {
+                        const entry = volumeImpacts.get(normalized.volumeId) ?? { checksum: 0, total: 0 };
+                        entry.total += 1;
+                        if (normalized.isChecksum)
+                            entry.checksum += 1;
+                        volumeImpacts.set(normalized.volumeId, entry);
+                    }
+
+                    this.log.error(
+                        'object %s %s slice %s verification failed: %s',
+                        record.id,
+                        normalized.sliceType,
+                        normalized.sliceKey,
+                        message
+                    );
+                }
+            }
+
+            if (this.cancelRequested)
+                return null;
+
             await this.deps.database.updateObjectVerificationState(record.id, {
-                lastVerifiedAt: startedAtMs,
-                sliceErrors: null
+                lastVerifiedAt: startedAt,
+                sliceErrors: Object.keys(sliceErrors).length ? sliceErrors : null
             });
+
             return {
-                checksumErrors: 0,
-                totalErrors: 0,
-                volumeImpacts: new Map()
+                checksumErrors,
+                totalErrors,
+                volumeImpacts
             };
         }
         catch (err) {
+            if (this.isIOAbortError(err)) {
+                this.cancelRequested = true;
+                this.log('object %s verification aborted due to I/O shutdown', record.id);
+                return null;
+            }
             const normalized = this.normalizeSliceError(record, err);
             const sliceErrors = normalized ? { [normalized.sliceKey]: normalized.info } : null;
             await this.deps.database.updateObjectVerificationState(record.id, {
-                lastVerifiedAt: startedAtMs,
+                lastVerifiedAt: startedAt,
                 sliceErrors
             });
 
@@ -226,7 +299,18 @@ export class VerifyJob {
             }
 
             const message = err instanceof Error ? err.message : String(err);
-            this.log.error('object %s verification failed: %s', record.id, message);
+            if (normalized) {
+                this.log.error(
+                    'object %s %s slice %s verification failed: %s',
+                    record.id,
+                    normalized.sliceType,
+                    normalized.sliceKey,
+                    message
+                );
+            }
+            else {
+                this.log.error('object %s verification failed: %s', record.id, message);
+            }
 
             return {
                 checksumErrors: normalized?.isChecksum ? 1 : 0,
@@ -234,109 +318,55 @@ export class VerifyJob {
                 volumeImpacts
             };
         }
-        finally {
-            if (object) {
-                try {
-                    await object.close();
-                }
-                catch (closeErr) {
-                    this.log.error('failed closing file object %s', record.id, closeErr);
-                }
-            }
-        }
     }
 
-    private consumeObject(object: FileObject): Promise<void> {
-        return new Promise<void>((resolve, reject) => {
-            let settled = false;
-            const cancellationError = new Error('verification canceled');
-
-            const cleanup = (): void => {
-                object.removeListener('data', onData);
-                object.removeListener('end', onEnd);
-                object.removeListener('error', onError);
+    private describeSlice(
+        record: StoredObjectRecord,
+        sliceIndex: number | null
+    ): { key: string; type: 'data' | 'parity' | 'unknown'; volumeId: number | null } {
+        if (sliceIndex === null)
+            return { key: 'unknown', type: 'unknown', volumeId: null };
+        if (sliceIndex < record.dataVolumes.length) {
+            return {
+                key: String(sliceIndex),
+                type: 'data',
+                volumeId: record.dataVolumes[sliceIndex] ?? null
             };
-
-            const abortIfCanceled = (): boolean => {
-                if (!this.cancelRequested || settled)
-                    return false;
-                settled = true;
-                cleanup();
-                void object.close().catch(() => undefined);
-                reject(cancellationError);
-                return true;
-            };
-
-            const onData = (): void => {
-                if (abortIfCanceled())
-                    return;
-                // intentionally discard data
-            };
-
-            const onEnd = (): void => {
-                if (abortIfCanceled())
-                    return;
-                settled = true;
-                cleanup();
-                resolve();
-            };
-
-            const onError = (err: Error): void => {
-                if (settled)
-                    return;
-                settled = true;
-                cleanup();
-                reject(err);
-            };
-
-            object.on('data', onData);
-            object.once('end', onEnd);
-            object.once('error', onError);
-
-            try {
-                object.setReadRange(0, object.size, true);
-            }
-            catch (err) {
-                cleanup();
-                reject(err as Error);
-                return;
-            }
-
-            if (abortIfCanceled())
-                return;
-
-            object.resume();
-            void abortIfCanceled();
-        });
+        }
+        const parityIndex = sliceIndex - record.dataVolumes.length;
+        return {
+            key: String(sliceIndex),
+            type: 'parity',
+            volumeId: record.parityVolumes[parityIndex] ?? null
+        };
     }
 
     private normalizeSliceError(
         record: StoredObjectRecord,
         err: unknown
-    ): { sliceKey: string; info: SliceErrorInfo; volumeId: number | null; isChecksum: boolean } | null {
+    ): { sliceKey: string; sliceType: 'data' | 'parity' | 'unknown'; info: SliceErrorInfo; volumeId: number | null; isChecksum: boolean } | null {
         const errorObj = err as Error & { code?: string; sliceIndex?: number; volumeId?: number };
         const sliceIndex = typeof errorObj.sliceIndex === 'number' ? errorObj.sliceIndex : null;
+        const descriptor = this.describeSlice(record, sliceIndex);
         const isChecksum = errorObj.code === 'ECHECKSUM';
-        const sliceKey = sliceIndex !== null ? String(sliceIndex) : 'unknown';
         const info: SliceErrorInfo = isChecksum
             ? { checksum: true }
             : { err: errorObj.message ?? String(err) };
-        const volumeId = errorObj.volumeId ?? this.resolveVolumeId(record, sliceIndex);
+        if (descriptor.type === 'data' || descriptor.type === 'parity')
+            info.type = descriptor.type;
+        const volumeId = errorObj.volumeId ?? descriptor.volumeId;
         return {
-            sliceKey,
+            sliceKey: descriptor.key,
+            sliceType: descriptor.type,
             info,
             volumeId,
             isChecksum
         };
     }
 
-    private resolveVolumeId(record: StoredObjectRecord, sliceIndex: number | null): number | null {
-        if (sliceIndex === null)
-            return null;
-        if (sliceIndex < record.dataVolumes.length)
-            return record.dataVolumes[sliceIndex] ?? null;
-        const parityIndex = sliceIndex - record.dataVolumes.length;
-        return record.parityVolumes[parityIndex] ?? null;
+    private isIOAbortError(err: unknown): boolean {
+        const errorObj = err as Error & { code?: string };
+        return errorObj?.code === 'IOABORT';
     }
 
     private async mergeVolumeResults(

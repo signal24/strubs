@@ -81,7 +81,7 @@ export class ContentRepository {
         });
     }
 
-    async findObjectsNeedingVerification(startedAt: number, limit: number): Promise<ContentDocument[]> {
+    async findObjectsNeedingVerification(startedAt: Date, limit: number): Promise<ContentDocument[]> {
         const cursor = this.collection.find<ContentDocument>({
             isFile: true,
             $or: [
@@ -98,7 +98,7 @@ export class ContentRepository {
 
     async updateObjectVerificationState(
         id: ObjectIdentifier,
-        updates: { lastVerifiedAt?: number; sliceErrors?: Record<string, SliceErrorInfo> | null }
+        updates: { lastVerifiedAt?: Date; sliceErrors?: Record<string, SliceErrorInfo> | null }
     ): Promise<void> {
         const set: Record<string, unknown> = {};
         const unset: Record<string, unknown> = {};

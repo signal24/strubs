@@ -18,7 +18,7 @@ export interface ContentDocument {
     damagedSlices?: number[];
     md5?: Buffer | null;
     mime?: string | null;
-    lastVerifiedAt?: number | null;
+    lastVerifiedAt?: Date | null;
     sliceErrors?: Record<string, SliceErrorInfo>;
     [key: string]: any;
 }
@@ -26,4 +26,5 @@ export interface ContentDocument {
 export type SliceErrorInfo = {
     checksum?: boolean;
     err?: string;
+    type?: 'data' | 'parity';
 };
